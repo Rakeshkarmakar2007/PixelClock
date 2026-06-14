@@ -14,7 +14,7 @@
 // --- USER CONFIGURATION ---
 const String firmware_version_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/version.txt";
 const String firmware_bin_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/firmware.bin";
-const float CURRENT_VERSION = 1.01; 
+const float CURRENT_VERSION = 1.00; 
 
 const char* ssid = "Vivo";
 const char* pass = "12345678";
@@ -35,6 +35,7 @@ const unsigned long WIFI_TIMEOUT    = 15000UL;
 SemaphoreHandle_t dataMutex;
 
 String matrixText = "Clock V1.00 ";
+String weatherCondition = "";
 int temperature   = 0;
 int humidity      = 0;
 bool showWeather  = false;
@@ -68,6 +69,31 @@ void setOfflineMode() {
   }
 }
 
+uint16_t getWeatherColor(String conditionType) {
+  // Matches Google Weather API strict enums (e.g., MOSTLY_CLEAR, HEAVY_RAIN)
+  if (conditionType.indexOf("CLEAR") >= 0) {
+    return matrix.Color(255, 200, 0); // Yellow/Orange (Sunny/Clear)
+  } 
+  else if (conditionType.indexOf("CLOUD") >= 0) {
+    return matrix.Color(150, 150, 150); // Gray (Cloudy)
+  } 
+  else if (conditionType.indexOf("THUNDER") >= 0 || conditionType.indexOf("STORM") >= 0) {
+    return matrix.Color(128, 0, 128); // Purple (Storms/Lightning)
+  } 
+  else if (conditionType.indexOf("RAIN") >= 0 || conditionType.indexOf("SHOWER") >= 0) {
+    return matrix.Color(0, 100, 255); // Blue (Rain/Showers)
+  } 
+  else if (conditionType.indexOf("SNOW") >= 0 || conditionType.indexOf("HAIL") >= 0) {
+    return matrix.Color(200, 255, 255); // Icy Light Blue (Snow/Hail)
+  } 
+  else if (conditionType.indexOf("WIND") >= 0) {
+    return matrix.Color(0, 255, 128); // Spring Green (Windy conditions)
+  }
+  
+  // Default color fallback
+  return matrix.Color(0, 255, 255); // Cyan
+}
+
 bool checkForUpdates() {
   WiFiClientSecure client;
   client.setInsecure();
@@ -96,7 +122,7 @@ bool checkForUpdates() {
       
       // 3. Scroll for 10 seconds (10000 milliseconds)
       unsigned long scrollStart = millis();
-      while (millis() - scrollStart < 10000) {
+      while (millis() - scrollStart < 20000) {
         matrix.fillScreen(0);
         matrix.setCursor(xPos, 1);
         matrix.setTextColor(matrix.Color(0, 255, 255)); // Cyan text
@@ -159,34 +185,38 @@ void fetchTimeAndWeather() {
   int httpCode = http.GET();
 
   if (httpCode == HTTP_CODE_OK) {
-      String payload = http.getString();
-      DynamicJsonDocument doc(4096);
-      DeserializationError err = deserializeJson(doc, payload);
-      
-      if (!err) {
-          JsonObject currentHour = doc["forecastHours"][1];
-          
-          if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-            temperature = (int)currentHour["temperature"]["degrees"].as<float>();
-            humidity    = currentHour["relativeHumidity"].as<int>();
-            int precipProb = currentHour["precipitation"]["probability"]["percent"].as<int>();
-            float precipMm = currentHour["precipitation"]["qpf"]["quantity"].as<float>();
-            
-            matrixText = currentHour["weatherCondition"]["description"]["text"].as<String>();
-            
-            if (precipProb > 60) {
-              matrixText += " ( Prob: " + String(precipProb) + "%)";
-            }
-            
-            showWeather = true;
-            lastWeatherSuccess = millis();
-            xSemaphoreGive(dataMutex);
-          }
-      } else {
-          setOfflineMode();
+    String payload = http.getString();
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, payload);
+    
+    if (!err) {
+      JsonObject currentHour = doc["forecastHours"][1];
+        
+      if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+        temperature = (int)currentHour["temperature"]["degrees"].as<float>();
+        humidity    = currentHour["relativeHumidity"].as<int>();
+        int precipProb = currentHour["precipitation"]["probability"]["percent"].as<int>();
+        float precipMm = currentHour["precipitation"]["qpf"]["quantity"].as<float>();
+        float airPressure = currentHour["airPressure"]["meanSeaLevelMillibars"].as<float>();
+        float windSpeed   = currentHour["wind"]["speed"]["value"].as<float>();
+        String windDir    = currentHour["wind"]["direction"]["cardinal"].as<String>();
+        matrixText = currentHour["weatherCondition"]["description"]["text"].as<String>();
+        weatherCondition = currentHour["weatherCondition"]["type"].as<String>();
+        if (precipProb > 0) {  
+            matrixText += " (Rain:" + String(precipProb) + "%, " + String(precipMm, 1) + "mm)";
+        }
+        // 4. Append wind and pressure to the matrix display
+        matrixText += " | Wind:" + String(windSpeed, 1) + "km/h " + windDir;
+        matrixText += " | Pressure:" + String(airPressure, 1) + "mb";
+        showWeather = true;
+        lastWeatherSuccess = millis();
+        xSemaphoreGive(dataMutex);
       }
-  } else {
+    } else {
       setOfflineMode();
+    }
+  } else {
+    setOfflineMode();
   }
   http.end();
   
@@ -195,10 +225,6 @@ void fetchTimeAndWeather() {
     unsigned long time = ntp.getEpochTime();
     if(time > 1000) {
       rtc.adjust(DateTime(time));
-      struct timeval tv;
-      tv.tv_sec = time;
-      tv.tv_usec = 0;
-      settimeofday(&tv, NULL);
     }
   }
 }
@@ -209,7 +235,7 @@ void setup() {
   display.setBrightness(255);
   matrix.begin();
   matrix.setTextWrap(false); 
-  matrix.setBrightness(52);
+  matrix.setBrightness(70);
   
   dataMutex = xSemaphoreCreateMutex();
 
@@ -230,10 +256,12 @@ void loop() {
   vTaskDelay(portMAX_DELAY); 
 }
 
+
 void MatrixCoreTask(void * pvParameters) {
   int x = matrix.width(); 
   bool showingStaticHumidity = false;
   String localText = "";
+  String localweatherCondition = "";
   bool localShowWeather = false;
   int localHumidity = 0;
 
@@ -244,33 +272,32 @@ void MatrixCoreTask(void * pvParameters) {
       localText = matrixText;
       localShowWeather = showWeather;
       localHumidity = humidity;
+      localweatherCondition = weatherCondition;
       xSemaphoreGive(dataMutex);
     }
 
     if (showingStaticHumidity && localShowWeather) {
-        matrix.setCursor(1, 1);
-        int pulse = (sin(millis() / 200.0) * 55) + 200; 
-        matrix.setTextColor(matrix.Color(0, pulse, pulse)); 
-        matrix.printf("H:%d%%", localHumidity);
-        matrix.show();
-        vTaskDelay(3000 / portTICK_PERIOD_MS); 
-        showingStaticHumidity = false;
-        x = matrix.width(); 
+      matrix.setCursor(1, 1);
+      int pulse = (sin(millis() / 200.0) * 55) + 200; 
+      matrix.setTextColor(matrix.Color(0, pulse, pulse)); 
+      matrix.printf("H:%d%%", localHumidity);
+      matrix.show();
+      vTaskDelay(3000 / portTICK_PERIOD_MS); 
+      showingStaticHumidity = false;
+      x = matrix.width(); 
     } 
     else {
-        matrix.setCursor(x, 1);
-        int len = localText.length();
-        for(int i = 0; i < len; i++) {
-            matrix.setTextColor(matrix.ColorHSV((i+1) * 1000));
-            matrix.print(localText[i]);
-        }
-        matrix.show();
-        int textWidth = len * 6;
-        if (--x < -textWidth) {
-            showingStaticHumidity = true; 
-            if(!localShowWeather) { x = matrix.width(); } 
-        }
-        vTaskDelay(80 / portTICK_PERIOD_MS); 
+      int len = localText.length();
+      matrix.setCursor(x, 1);
+      matrix.setTextColor(getWeatherColor(localweatherCondition));
+      matrix.print(localText);
+      matrix.show();
+      int textWidth = len * 6;
+      if (--x < -textWidth) {
+        showingStaticHumidity = true; 
+        if(!localShowWeather) { x = matrix.width(); } 
+      }
+      vTaskDelay(80 / portTICK_PERIOD_MS); 
     }
   }
 }
@@ -316,7 +343,6 @@ void SevenSegCoreTask(void * pvParameters) {
 
 void NetworkCoreTask(void * pvParameters) {
   
-  // --- BOOT UP SEQUENCE ---
   WiFi.begin(ssid, pass);
   unsigned long startWait = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - startWait < WIFI_TIMEOUT)) {
@@ -325,15 +351,10 @@ void NetworkCoreTask(void * pvParameters) {
   
   if(WiFi.status() == WL_CONNECTED) {
     fetchTimeAndWeather();
-    
-    // Check for OTA updates ONLY once on boot
     bool isUpdating = checkForUpdates(); 
-    
     if (isUpdating) {
-        // If an update succeeds, the ESP32 resets automatically.
-        // If we reach this line, the update FAILED. Restart device to recover tasks.
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-        ESP.restart();
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      ESP.restart();
     }
     
   } else {
