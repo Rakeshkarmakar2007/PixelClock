@@ -6,9 +6,20 @@
 #include <NTPClient.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <SevenSegmentPixelDisplay.h>
+
+// --- USER CONFIGURATION ---
+const String firmware_version_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/version.txt";
+const String firmware_bin_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/firmware.bin";
+const float CURRENT_VERSION = 1.01; 
+
+const char* ssid = "Vivo";
+const char* pass = "12345678";
+const char* GOOGLE_API_KEY = "AIzaSyDAYGOg0JUN7LyNpdmsxzGgkxiAMvTUAqc"; 
+// --------------------------
 
 #define PIN_7SEG     25
 #define PIN_MATRIX   26
@@ -18,16 +29,12 @@ const int timeoffset         = 19800;
 static const float LATITUDE  = 23.4000f;
 static const float LONGITUDE = 88.5000f;
 
-const char* ssid = "Vivo";
-const char* pass = "12345678";
-const char* GOOGLE_API_KEY = "AIzaSyDAYGOg0JUN7LyNpdmsxzGgkxiAMvTUAqc"; 
-
 const unsigned long WEATHER_TIMEOUT = 30 * 60 * 1000UL; 
 const unsigned long WIFI_TIMEOUT    = 15000UL;          
 
 SemaphoreHandle_t dataMutex;
 
-String matrixText = "Searching for WiFi...";
+String matrixText = "Clock V1.00 ";
 int temperature   = 0;
 int humidity      = 0;
 bool showWeather  = false;
@@ -42,12 +49,12 @@ Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(30, 9, PIN_MATRIX,
   NEO_MATRIX_TOP + NEO_MATRIX_RIGHT + NEO_MATRIX_ROWS + NEO_MATRIX_ZIGZAG, 
   NEO_GRB + NEO_KHZ800);
 
-// টাস্ক হ্যান্ডেলারসমূহ
+// Task Handles
 TaskHandle_t MatrixTaskHandle = NULL;
 TaskHandle_t SevenSegTaskHandle = NULL;
 TaskHandle_t NetworkTaskHandle = NULL;
 
-// টাস্ক প্রোটোটাইপ
+// Task Prototypes
 void MatrixCoreTask(void * pvParameters);
 void SevenSegCoreTask(void * pvParameters);
 void NetworkCoreTask(void * pvParameters);
@@ -59,6 +66,65 @@ void setOfflineMode() {
     matrixText = "Date:- " + String(now.day()) + "/" + String(now.month()) + "/" + String(now.year());
     xSemaphoreGive(dataMutex);
   }
+}
+
+bool checkForUpdates() {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.begin(client, firmware_version_url);
+
+  int httpCode = http.GET();
+  bool updateInitiated = false;
+
+  if (httpCode == HTTP_CODE_OK) {
+    String newVersionStr = http.getString();
+    float newVersion = newVersionStr.toFloat();
+
+    if (newVersion > CURRENT_VERSION) {
+      updateInitiated = true;
+
+      // 1. Turn off the display tasks immediately 
+      if (MatrixTaskHandle != NULL) vTaskDelete(MatrixTaskHandle);
+      if (SevenSegTaskHandle != NULL) vTaskDelete(SevenSegTaskHandle);
+
+      // 2. Prepare scrolling text
+      String updateText = "new version available: " + String(newVersion, 2) + ". updating....";
+      int textWidth = updateText.length() * 6;
+      int xPos = matrix.width();
+      
+      // 3. Scroll for 10 seconds (10000 milliseconds)
+      unsigned long scrollStart = millis();
+      while (millis() - scrollStart < 10000) {
+        matrix.fillScreen(0);
+        matrix.setCursor(xPos, 1);
+        matrix.setTextColor(matrix.Color(0, 255, 255)); // Cyan text
+        matrix.print(updateText); 
+        matrix.show();
+
+        if (--xPos < -textWidth) {
+          xPos = matrix.width(); 
+        }
+        vTaskDelay(80 / portTICK_PERIOD_MS); 
+      }
+
+      // Close the HTTP connection for the version check before starting the bin download
+      http.end(); 
+      
+      // Give the ESP32 a brief moment to settle
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+      // 4. Execute OTA Update (Wi-Fi is still fully connected here)
+      httpUpdate.update(client, firmware_bin_url);
+    }
+  } 
+  
+  if (!updateInitiated) {
+    http.end();
+  }
+  
+  return updateInitiated;
 }
 
 void fetchTimeAndWeather() {
@@ -81,7 +147,6 @@ void fetchTimeAndWeather() {
   snprintf(url, sizeof(url),
       "https://weather.googleapis.com/v1/forecast/hours:lookup?key=%s&location.latitude=%.4f&location.longitude=%.4f&hours=2",
       GOOGLE_API_KEY, LATITUDE, LONGITUDE);
-
   
   WiFiClientSecure client;
   client.setInsecure(); 
@@ -101,15 +166,16 @@ void fetchTimeAndWeather() {
       if (!err) {
           JsonObject currentHour = doc["forecastHours"][1];
           
-          
           if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
             temperature = (int)currentHour["temperature"]["degrees"].as<float>();
             humidity    = currentHour["relativeHumidity"].as<int>();
-            int precip  = currentHour["precipitation"]["probability"]["percent"].as<int>();
+            int precipProb = currentHour["precipitation"]["probability"]["percent"].as<int>();
+            float precipMm = currentHour["precipitation"]["qpf"]["quantity"].as<float>();
             
             matrixText = currentHour["weatherCondition"]["description"]["text"].as<String>();
-            if (precip > 60) {
-                matrixText += " (Rain:" + String(precip) +"%)";
+            
+            if (precipProb > 60) {
+              matrixText += " ( Prob: " + String(precipProb) + "%)";
             }
             
             showWeather = true;
@@ -126,10 +192,14 @@ void fetchTimeAndWeather() {
   
   ntp.begin();
   if (ntp.update()) { 
-      unsigned long time = ntp.getEpochTime();
-      if(time > 1000) {
-          rtc.adjust(DateTime(time));
-      }
+    unsigned long time = ntp.getEpochTime();
+    if(time > 1000) {
+      rtc.adjust(DateTime(time));
+      struct timeval tv;
+      tv.tv_sec = time;
+      tv.tv_usec = 0;
+      settimeofday(&tv, NULL);
+    }
   }
 }
 
@@ -140,7 +210,6 @@ void setup() {
   matrix.begin();
   matrix.setTextWrap(false); 
   matrix.setBrightness(52);
-
   
   dataMutex = xSemaphoreCreateMutex();
 
@@ -151,7 +220,6 @@ void setup() {
       delay(1000); ESP.restart();
     }
   }
-
   
   xTaskCreatePinnedToCore(MatrixCoreTask, "MatrixTask", 4096, NULL, 1, &MatrixTaskHandle, 0);
   xTaskCreatePinnedToCore(SevenSegCoreTask, "SevenSegTask", 3072, NULL, 2, &SevenSegTaskHandle, 1);
@@ -161,7 +229,6 @@ void setup() {
 void loop() {
   vTaskDelay(portMAX_DELAY); 
 }
-
 
 void MatrixCoreTask(void * pvParameters) {
   int x = matrix.width(); 
@@ -247,22 +314,36 @@ void SevenSegCoreTask(void * pvParameters) {
   }
 }
 
-
 void NetworkCoreTask(void * pvParameters) {
   
+  // --- BOOT UP SEQUENCE ---
   WiFi.begin(ssid, pass);
   unsigned long startWait = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - startWait < WIFI_TIMEOUT)) {
     vTaskDelay(200 / portTICK_PERIOD_MS);
   }
+  
   if(WiFi.status() == WL_CONNECTED) {
     fetchTimeAndWeather();
+    
+    // Check for OTA updates ONLY once on boot
+    bool isUpdating = checkForUpdates(); 
+    
+    if (isUpdating) {
+        // If an update succeeds, the ESP32 resets automatically.
+        // If we reach this line, the update FAILED. Restart device to recover tasks.
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        ESP.restart();
+    }
+    
   } else {
     setOfflineMode();
   }
+  
+  // This is only called if no update is happening
   WiFi.disconnect(true);
 
-  
+  // --- REGULAR UPDATE LOOP (Every 10 minutes) ---
   for(;;) {
   
     vTaskDelay((10 * 60 * 1000) / portTICK_PERIOD_MS); 
