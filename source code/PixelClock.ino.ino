@@ -14,7 +14,7 @@
 // --- USER CONFIGURATION ---
 const String firmware_version_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/version.txt";
 const String firmware_bin_url = "https://raw.githubusercontent.com/Rakeshkarmakar2007/PixelClock/refs/heads/main/main/firmware.bin";
-const float CURRENT_VERSION = 1.00; 
+const float CURRENT_VERSION = 1.20; 
 
 const char* ssid = "Vivo";
 const char* pass = "12345678";
@@ -34,7 +34,7 @@ const unsigned long WIFI_TIMEOUT    = 15000UL;
 
 SemaphoreHandle_t dataMutex;
 
-String matrixText = "Clock V1.00 ";
+String matrixText = "clock V1.2";
 String weatherCondition = "";
 int temperature   = 0;
 int humidity      = 0;
@@ -81,13 +81,13 @@ uint16_t getWeatherColor(String conditionType) {
     return matrix.Color(128, 0, 128); // Purple (Storms/Lightning)
   } 
   else if (conditionType.indexOf("RAIN") >= 0 || conditionType.indexOf("SHOWER") >= 0) {
-    return matrix.Color(0, 100, 255); // Blue (Rain/Showers)
+    return matrix.Color(0, 100, 255);
   } 
   else if (conditionType.indexOf("SNOW") >= 0 || conditionType.indexOf("HAIL") >= 0) {
-    return matrix.Color(200, 255, 255); // Icy Light Blue (Snow/Hail)
+    return matrix.Color(200, 255, 255); 
   } 
   else if (conditionType.indexOf("WIND") >= 0) {
-    return matrix.Color(0, 255, 128); // Spring Green (Windy conditions)
+    return matrix.Color(0, 255, 128); 
   }
   
   // Default color fallback
@@ -152,11 +152,10 @@ bool checkForUpdates() {
   
   return updateInitiated;
 }
-
 void fetchTimeAndWeather() {
   if(WiFi.status() != WL_CONNECTED) {
-      setOfflineMode();
-      return;
+    setOfflineMode();
+    return;
   }
   
   IPAddress ip;
@@ -164,70 +163,110 @@ void fetchTimeAndWeather() {
   int dnsStatus = WiFi.hostByName("google.com", ip);
   unsigned long pingTime = millis() - pingStart;
 
-  if (dnsStatus != 1 || pingTime > 3500) {
-      setOfflineMode();
-      return; 
+  if (dnsStatus != 1 || pingTime > 1500) {
+    setOfflineMode();
+    return; 
   }
 
+ 
   char url[512];
-  snprintf(url, sizeof(url),
-      "https://weather.googleapis.com/v1/forecast/hours:lookup?key=%s&location.latitude=%.4f&location.longitude=%.4f&hours=2",
-      GOOGLE_API_KEY, LATITUDE, LONGITUDE);
-  
+  snprintf(url, sizeof(url), "https://weather.googleapis.com/v1/forecast/hours:lookup?key=%s&location.latitude=%.4f&location.longitude=%.4f&hours=10", GOOGLE_API_KEY, LATITUDE, LONGITUDE);
+
   WiFiClientSecure client;
   client.setInsecure(); 
   
   HTTPClient http;
   http.begin(client, url);
-  http.setTimeout(10000); 
+  http.setTimeout(12000); 
   http.setUserAgent("ESP32-Weather-Matrix/2.0"); 
 
   int httpCode = http.GET();
 
   if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(4096);
-    DeserializationError err = deserializeJson(doc, payload);
-    
-    if (!err) {
-      JsonObject currentHour = doc["forecastHours"][1];
-        
-      if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
-        temperature = (int)currentHour["temperature"]["degrees"].as<float>();
-        humidity    = currentHour["relativeHumidity"].as<int>();
-        int precipProb = currentHour["precipitation"]["probability"]["percent"].as<int>();
-        float precipMm = currentHour["precipitation"]["qpf"]["quantity"].as<float>();
-        float airPressure = currentHour["airPressure"]["meanSeaLevelMillibars"].as<float>();
-        float windSpeed   = currentHour["wind"]["speed"]["value"].as<float>();
-        String windDir    = currentHour["wind"]["direction"]["cardinal"].as<String>();
-        matrixText = currentHour["weatherCondition"]["description"]["text"].as<String>();
-        weatherCondition = currentHour["weatherCondition"]["type"].as<String>();
-        if (precipProb > 0) {  
-            matrixText += " (Rain:" + String(precipProb) + "%, " + String(precipMm, 1) + "mm)";
-        }
-        // 4. Append wind and pressure to the matrix display
-        matrixText += " | Wind:" + String(windSpeed, 1) + "km/h " + windDir;
-        matrixText += " | Pressure:" + String(airPressure, 1) + "mb";
-        showWeather = true;
-        lastWeatherSuccess = millis();
-        xSemaphoreGive(dataMutex);
+      String payload = http.getString();
+      
+  
+      DynamicJsonDocument doc(16384);
+      DeserializationError err = deserializeJson(doc, payload);
+      
+      if (!err) {
+          JsonArray hoursArray = doc["forecastHours"].as<JsonArray>();
+          int availableHours = hoursArray.size();
+
+          if (availableHours > 0) {
+              JsonObject currentHour = hoursArray[0];
+              
+              if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+                  temperature = (int)currentHour["temperature"]["degrees"].as<float>();
+                  humidity    = currentHour["relativeHumidity"].as<int>();
+                  
+                  String currentCondition = currentHour["weatherCondition"]["description"]["text"].as<String>();
+                  int feelsLike = (int)currentHour["feelsLikeTemperature"]["degrees"].as<float>();
+                  weatherCondition = currentHour["weatherCondition"]["type"].as<String>();
+                  matrixText = currentCondition + ". Feels like " + String(feelsLike) + "*C. ";
+
+                  int rainHour = -1;
+                  int rainMin = 0;
+                  int rainChance = 0;
+                  bool isStorm = false;
+
+                  for (int i = 0; i < availableHours; i++) {
+                      JsonObject hourData = hoursArray[i];
+                      int prob = hourData["precipitation"]["probability"]["percent"].as<int>();
+                      int thunderProb = hourData["thunderstormProbability"].as<int>();
+
+                      if (prob >= 25 || thunderProb > 35) {
+                          rainHour = hourData["displayDateTime"]["hours"].as<int>();
+                          rainMin = hourData["displayDateTime"]["minutes"].as<int>();
+                          rainChance = prob;
+                          if (thunderProb > 45) isStorm = true;
+                          
+                          break; 
+                      }
+                  }
+                  if (rainHour != -1) {
+                      String ampm = (rainHour >= 12) ? "PM" : "AM";
+                      int displayHour = rainHour % 12;
+                      if (displayHour == 0) displayHour = 12;
+                      
+                      char timeBuf[12];
+                      sprintf(timeBuf, "%02d:%02d %s", displayHour, rainMin, ampm.c_str());
+
+                      if (isStorm) {
+                          matrixText += "Storm Alert at:" + String(timeBuf) + "! ";
+                      } else {
+                          matrixText += "Rain expected at:" + String(timeBuf) + " (" + String(rainChance) + "%) ";
+                      }
+                  } else {
+                      matrixText += "No rain expected in next 10 hours. ";
+                  }
+
+                  if (feelsLike - temperature >= 5) {
+                      matrixText += "Very Humid! ";
+                  }
+
+                  showWeather = true;
+                  lastWeatherSuccess = millis();
+                  xSemaphoreGive(dataMutex);
+              }
+          }
+      } else {
+          setOfflineMode();
       }
-    } else {
-      setOfflineMode();
-    }
   } else {
-    setOfflineMode();
+      setOfflineMode();
   }
   http.end();
   
   ntp.begin();
   if (ntp.update()) { 
-    unsigned long time = ntp.getEpochTime();
-    if(time > 1000) {
-      rtc.adjust(DateTime(time));
-    }
+      unsigned long time = ntp.getEpochTime();
+      if(time > 1000) {
+          rtc.adjust(DateTime(time));
+      }
   }
 }
+
 
 void setup() {
   Wire.begin();
